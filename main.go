@@ -60,11 +60,37 @@ var (
 )
 
 type AddedTrack struct {
-	Path     string `json:"path"`
-	Artist   string `json:"artist"`
-	ArtistID string `json:"artist_id"`
-	Album    string `json:"album"`
-	Song     string `json:"song"`
+	Path      string       `json:"path"`
+	Artist    string       `json:"artist"`
+	ArtistID  string       `json:"artist_id"`
+	Artists   []ArtistInfo `json:"artists,omitempty"`
+	Album     string       `json:"album"`
+	AlbumID   string       `json:"album_id"`
+	Song      string       `json:"song"`
+}
+
+type ArtistInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+func getArtistsFromTrack(data []struct {
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	Href       string `json:"href"`
+	Attributes struct {
+		Name string `json:"name"`
+	} `json:"attributes"`
+}) (string, []ArtistInfo) {
+	if len(data) == 0 {
+		return "", nil
+	}
+	primaryID := data[0].ID
+	var artists []ArtistInfo
+	for _, a := range data {
+		artists = append(artists, ArtistInfo{ID: a.ID, Name: a.Attributes.Name})
+	}
+	return primaryID, artists
 }
 
 func loadConfig() error {
@@ -786,6 +812,23 @@ func convertIfNeeded(track *task.Track) {
 	} else {
 		fmt.Printf("Conversion completed in %s: %s\n", time.Since(start).Truncate(time.Millisecond), filepath.Base(outPath))
 
+		// Embed lyrics into FLAC if available
+		if targetFmt == "flac" {
+			lrcPath := strings.TrimSuffix(srcPath, ext) + ".lrc"
+			if lrcData, err := os.ReadFile(lrcPath); err == nil && len(lrcData) > 0 {
+				if _, metaErr := exec.LookPath("metaflac"); metaErr == nil {
+					lrcCmd := exec.Command("metaflac",
+						"--set-tag=LYRICS="+string(lrcData),
+						outPath)
+					if err := lrcCmd.Run(); err != nil {
+						fmt.Printf("Warning: failed to embed lyrics in FLAC: %v\n", err)
+					} else {
+						fmt.Println("Lyrics embedded into FLAC.")
+					}
+				}
+			}
+		}
+
 		if !Config.ConvertKeepOriginal {
 			if err := os.Remove(srcPath); err != nil {
 				fmt.Println("Failed to remove original after conversion:", err)
@@ -927,15 +970,14 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 		counter.Success++
 		okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 
-		tArtistId := ""
-		if len(track.Resp.Relationships.Artists.Data) > 0 {
-			tArtistId = track.Resp.Relationships.Artists.Data[0].ID
-		}
+		tArtistId, tArtists := getArtistsFromTrack(track.Resp.Relationships.Artists.Data)
 		AddedTracks = append(AddedTracks, AddedTrack{
 			Path:     trackPath,
 			Artist:   track.Resp.Attributes.ArtistName,
 			ArtistID: tArtistId,
+			Artists:  tArtists,
 			Album:    track.Resp.Attributes.AlbumName,
+			AlbumID:  track.PreID,
 			Song:     track.Resp.Attributes.Name,
 		})
 		return
@@ -947,15 +989,14 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 			counter.Success++
 			okDict[track.PreID] = append(okDict[track.PreID], track.TaskNum)
 
-			tArtistId := ""
-			if len(track.Resp.Relationships.Artists.Data) > 0 {
-				tArtistId = track.Resp.Relationships.Artists.Data[0].ID
-			}
+			tArtistId, tArtists := getArtistsFromTrack(track.Resp.Relationships.Artists.Data)
 			AddedTracks = append(AddedTracks, AddedTrack{
 				Path:     convertedPath,
 				Artist:   track.Resp.Attributes.ArtistName,
 				ArtistID: tArtistId,
+				Artists:  tArtists,
 				Album:    track.Resp.Attributes.AlbumName,
+				AlbumID:  track.PreID,
 				Song:     track.Resp.Attributes.Name,
 			})
 			return
@@ -1066,15 +1107,14 @@ func ripTrack(track *task.Track, token string, mediaUserToken string) {
 	// CONVERSION FEATURE hook
 	convertIfNeeded(track)
 
-	tArtistId := ""
-	if len(track.Resp.Relationships.Artists.Data) > 0 {
-		tArtistId = track.Resp.Relationships.Artists.Data[0].ID
-	}
+	tArtistId, tArtists := getArtistsFromTrack(track.Resp.Relationships.Artists.Data)
 	AddedTracks = append(AddedTracks, AddedTrack{
 		Path:     track.SavePath,
 		Artist:   track.Resp.Attributes.ArtistName,
 		ArtistID: tArtistId,
+		Artists:  tArtists,
 		Album:    track.Resp.Attributes.AlbumName,
+		AlbumID:  track.PreID,
 		Song:     track.Resp.Attributes.Name,
 	})
 
@@ -1206,6 +1246,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 				Artist:   "Apple Music Station",
 				ArtistID: "",
 				Album:    station.Name,
+				AlbumID:  station.ID,
 				Song:     station.Name,
 			})
 			return nil
@@ -1248,6 +1289,7 @@ func ripStation(albumId string, token string, storefront string, mediaUserToken 
 			Artist:   "Apple Music Station",
 			ArtistID: "",
 			Album:    station.Name,
+			AlbumID:  station.ID,
 			Song:     station.Name,
 		})
 		counter.Success++
@@ -2170,15 +2212,21 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 		mvAlbumName := MVInfo.Data[0].Attributes.AlbumName
 		mvName := MVInfo.Data[0].Attributes.Name
 		mvArtistId := ""
-		if len(MVInfo.Data[0].Relationships.Artists.Data) > 0 {
-			mvArtistId = MVInfo.Data[0].Relationships.Artists.Data[0].ID
+		var mvArtists []ArtistInfo
+		for _, a := range MVInfo.Data[0].Relationships.Artists.Data {
+			mvArtists = append(mvArtists, ArtistInfo{ID: a.ID, Name: a.Attributes.Name})
+		}
+		if len(mvArtists) > 0 {
+			mvArtistId = mvArtists[0].ID
 		}
 
 		AddedTracks = append(AddedTracks, AddedTrack{
 			Path:     mvOutPath,
 			Artist:   mvArtistName,
 			ArtistID: mvArtistId,
+			Artists:  mvArtists,
 			Album:    mvAlbumName,
+			AlbumID:  adamID,
 			Song:     mvName,
 		})
 		return nil
@@ -2278,15 +2326,21 @@ func mvDownloader(adamID string, saveDir string, token string, storefront string
 	mvAlbumName := MVInfo.Data[0].Attributes.AlbumName
 	mvName := MVInfo.Data[0].Attributes.Name
 	mvArtistId := ""
-	if len(MVInfo.Data[0].Relationships.Artists.Data) > 0 {
-		mvArtistId = MVInfo.Data[0].Relationships.Artists.Data[0].ID
+	var mvArtists []ArtistInfo
+	for _, a := range MVInfo.Data[0].Relationships.Artists.Data {
+		mvArtists = append(mvArtists, ArtistInfo{ID: a.ID, Name: a.Attributes.Name})
+	}
+	if len(mvArtists) > 0 {
+		mvArtistId = mvArtists[0].ID
 	}
 
 	AddedTracks = append(AddedTracks, AddedTrack{
 		Path:     mvOutPath,
 		Artist:   mvArtistName,
 		ArtistID: mvArtistId,
+		Artists:  mvArtists,
 		Album:    mvAlbumName,
+		AlbumID:  adamID,
 		Song:     mvName,
 	})
 

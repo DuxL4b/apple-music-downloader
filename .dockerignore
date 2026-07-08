@@ -5,3 +5,7 @@
 !/main.go
 !/utils/
 !/utils/**
+!/cmd/
+!/cmd/**
+!/api/
+!/api/**
